@@ -1,0 +1,122 @@
+#!/bin/bash
+
+function print_usage() {
+    (>&2 echo "Usage: $0 -e <client email> [-f <private key file> | -k <private key>] -s <API scope>")
+}
+
+# base64url encoding is different than Base64 encoding.
+# The main documentation I could find is at http://base64url.com
+# It takes base64 encoding, removes = (equals signs are just padding),
+# then replaces + with - and / with _ to be URL string compliant.
+function base64url() {
+    base64 | sed -e 's/=//g' -e 's/\+/-/g' -e 's/\//_/g'
+}
+
+declare CLIENT_EMAIL=
+declare PRIVATE_KEY_FILE=
+declare PRIVATE_KEY=
+declare SCOPE=
+
+# Process all the arguments and set
+# the appropriate script variables.
+while getopts e:f:k:s: flag; do
+    case "$flag" in
+        e) CLIENT_EMAIL="$OPTARG" ;;
+        f) PRIVATE_KEY_FILE="$OPTARG" ;;
+        k) PRIVATE_KEY="$OPTARG" ;;
+        s) SCOPE="$OPTARG" ;;
+        *) print_usage; exit 1 ;;
+    esac
+done
+
+if [ -z "$CLIENT_EMAIL" ] || [ -z "${PRIVATE_KEY}${PRIVATE_KEY_FILE}" ] || [ -z "$SCOPE" ]; then
+    print_usage
+    exit 1
+fi
+
+# If we have a defined PRIVATE_KEY value,
+# then we will use that, regardless of if
+# we were given a PRIVATE_KEY_FILE value.
+if [[ -n "$PRIVATE_KEY" ]]; then
+    PRIVATE_KEY_FILE=$(mktemp /tmp/auth.XXXXXXXX)
+
+    # When we get the private key as a value,
+    # this echo has a tendency to replace newlines
+    # with spaces, regardless of the flags it is
+    # given. The sed command replaces the spaces
+    # before and after the BEGIN/END PRIVATE KEY
+    # clauses with newlines so that openssl will
+    # read it correctly.
+    echo "$PRIVATE_KEY" | sed \
+                              -e 's/- /\n/g' \
+                              -e 's/ -/\n/g' \
+                              > $PRIVATE_KEY_FILE
+fi
+
+# Set the request time to the number of seconds since the Unix epoch.
+# Set the expiration time to be one hour past the request time.
+declare -i IAT=$(date +%s)
+declare -i EXP=$((IAT+3600))
+
+# Set the header to indicate a JWT signed with RSA256
+JWT_HEADER_RAW="{\"alg\":\"RS256\",\"typ\":\"JWT\"}"
+JWT_HEADER_B64=$(printf "$JWT_HEADER_RAW" | base64url)
+
+# Generate the JSON claimset.
+JWT_CLAIMSET_RAW="{\
+    \"iss\": \"$CLIENT_EMAIL\",\
+    \"scope\": \"$SCOPE\",\
+    \"aud\": \"https://www.googleapis.com/oauth2/v4/token\",\
+    \"exp\":$EXP,\
+    \"iat\":$IAT\
+}"
+JWT_CLAIMSET_B64=$(printf "$JWT_CLAIMSET_RAW" | base64url)
+
+# The main content is <header>.<claimset> and is
+# hashed then signed to generate the signature.
+JWS="${JWT_HEADER_B64}.${JWT_CLAIMSET_B64}"
+JWT_SIGNATURE=$(printf "$JWS" | openssl dgst -binary -sha256 -sign "$PRIVATE_KEY_FILE" | base64url)
+
+# Check to make sure openssl ran successfully before we do anything else.
+# It has a tendency to be fairly picky and can complain if your private key
+# is bad. This is the main point of failure for this tool.
+if [[ $? -ne 0 ]]; then
+    echo -n ""
+    exit 1
+fi
+
+# A JWT consists of <header>.<body>.<signature>,
+# where each portion is base64url encoded.
+JWT="${JWS}.${JWT_SIGNATURE}"
+
+# If we generated a temporary file, delete
+# it because we no longer need it.
+if [[ -n "$PRIVATE_KEY" ]]; then
+    rm $PRIVATE_KEY_FILE
+fi
+
+# Send the request to the Google auth service.
+declare -r AUTH=$(curl -s -X POST \
+                       --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+                       --data-urlencode "assertion=${JWT}" \
+                       https://www.googleapis.com/oauth2/v4/token)
+
+# This is the value that you actually need
+# for validating requests to the Google API.
+declare -r ACCESS_TOKEN=$(printf "$AUTH" | jq -r '.access_token')
+
+# These are not used here, but could be useful for someone,
+# so I have left them in to show that they exist.
+
+# EXPIRES_IN represents the number of seconds before the token
+# is no longer valid. It appears to always be 3600 (one hour)
+# regardless of what is passed under $EXP above.
+declare -r EXPIRES_IN=$(printf "$AUTH" | jq -r '.expires_in')
+
+# TOKEN_TYPE represents what type of token you have been granted,
+# which is used in the header as "Authorization: $TOKEN_TYPE $ACCESS_TOKEN",
+# but it appears to always be "Bearer."
+declare -r TOKEN_TYPE=$(printf "$AUTH" | jq -r '.token_type')
+
+# Output the token for your use
+echo -n "$ACCESS_TOKEN"
